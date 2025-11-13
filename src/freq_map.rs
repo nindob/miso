@@ -1,62 +1,93 @@
-// src/freq_map.rs
 use std::collections::HashMap;
 
-/// Per-payload frequency mapping.
-/// - `forward[token] = mapped_id`
-/// - `reverse[mapped_id] = token` (tokens ordered by rank)
+/// FreqMap holds a *per-payload* mapping between:
+/// - original token IDs (from the tokenizer), and
+/// - dense, frequency-ranked "mapped IDs" starting at 0.
 ///
-/// Later we'll also store/serialize minimal header metadata
-/// (e.g., lengths) so decode can rebuild the map.
+/// High-level idea:
+///   - For a given payload, we look at all token IDs that appear.
+///   - We count their frequencies.
+///   - We sort tokens by frequency (desc), then by token ID (asc).
+///   - We assign mapped IDs 0, 1, 2, ... in that order.
+/// This makes common tokens map to small integers, which helps later zigzag/varint compression.
 #[derive(Debug, Clone)]
 pub struct FreqMap {
-    /// Original token -> mapped ID (dense ranks starting at 0)
-    forward: HashMap<i32, i32>,
-    /// Indexed by mapped ID; holds the original token at that rank.
-    reverse: Vec<i32>,
-    /// Optional: raw counts we used to build the ranking (kept for debugging/metrics).
-    counts: HashMap<i32, u32>,
+    /// original token ID -> mapped ID (0..N-1)
+    token_to_mapped: HashMap<i32, i32>,
+
+    /// mapped ID (as index) -> original token ID
+    ///
+    /// invariant: mapped_to_token[mapped_id] == original_token
+    mapped_to_token: Vec<i32>,
 }
 
 impl FreqMap {
-    /// Build a FreqMap from raw token IDs.
+    /// Build a frequency-based mapping from a slice of token IDs.
     ///
-    /// Steps to implement (in the next pass):
-    /// 1) Count occurrences of each token.
-    /// 2) Produce a ranked list of tokens:
-    ///    - Sort by descending count, then ascending token ID for stable ties.
-    /// 3) Assign mapped IDs [0..len), fill `forward` and `reverse`.
-    pub fn from_token_ids(_ids: &[i32]) -> Self {
-        // TODO: implement logic
-        // Placeholder so we compile for now.
+    /// Algorithm:
+    ///  1. Count frequency of each token in `ids`.
+    ///  2. Collect (token, count) into a Vec.
+    ///  3. Sort by count desc, then token asc (for deterministic tie-breaking).
+    ///  4. Assign mapped IDs 0..N-1 in that order and fill both lookup structures.
+    pub fn from_token_ids(ids: &[i32]) -> Self {
+        // 1) Count frequencies for this payload.
+        let mut counts: HashMap<i32, usize> = HashMap::new();
+        for &token in ids {
+            *counts.entry(token).or_insert(0) += 1;
+        }
+
+        // 2) Collect into a sortable Vec so ordering is deterministic.
+        let mut entries: Vec<(i32, usize)> = counts.into_iter().collect();
+
+        // 3) Sort:
+        //    - primary key: frequency descending (higher count first)
+        //    - secondary key: token ID ascending (for stable, deterministic ordering)
+        entries.sort_by(|a, b| {
+            b.1.cmp(&a.1)                // compare counts, reversed for DESC
+                .then_with(|| a.0.cmp(&b.0)) // tie-break with token ID ASC
+        });
+
+        // 4) Assign mapped IDs and build forward & reverse lookups.
+        let mut token_to_mapped = HashMap::with_capacity(entries.len());
+        let mut mapped_to_token = Vec::with_capacity(entries.len());
+
+        for (mapped_id, (token, _count)) in entries.into_iter().enumerate() {
+            token_to_mapped.insert(token, mapped_id as i32);
+            mapped_to_token.push(token);
+        }
+
         Self {
-            forward: HashMap::new(),
-            reverse: Vec::new(),
-            counts: HashMap::new(),
+            token_to_mapped,
+            mapped_to_token,
         }
     }
 
-    /// Map an original token -> mapped ID for the encode path.
-    /// Returns None if the token was not present in this payload.
-    pub fn map_token(&self, _token: i32) -> Option<i32> {
-        // TODO: implement
-        todo!("return self.forward.get(&token).copied()")
+    /// Look up the mapped ID for an original token.
+    ///
+    /// Returns:
+    ///   - Some(mapped_id) if the token is present in this payload,
+    ///   - None if the token never appeared when we built the map.
+    pub fn map_token(&self, token: i32) -> Option<i32> {
+        self.token_to_mapped.get(&token).copied()
     }
 
-    /// Reverse lookup: mapped ID -> original token (for decode).
-    pub fn unmap_token(&self, _mapped: i32) -> Option<i32> {
-        // TODO: implement
-        todo!("self.reverse.get(mapped as usize).copied()")
+    /// Inverse lookup: mapped ID -> original token ID.
+    ///
+    /// Returns:
+    ///   - Some(token) if `mapped` is a valid mapped ID (0 <= mapped < len),
+    ///   - None if out-of-range.
+    pub fn unmap_token(&self, mapped: i32) -> Option<i32> {
+        if mapped < 0 {
+            return None;
+        }
+        self.mapped_to_token.get(mapped as usize).copied()
     }
 
-    /// Slice of tokens ordered by mapped ID; used when serializing the header.
+    /// Returns a slice of original token IDs, in mapped-ID order.
+    ///
+    /// That is, ordered_tokens()[i] == token whose mapped ID is `i`.
     pub fn ordered_tokens(&self) -> &[i32] {
-        // This one can work now even before we fill logic.
-        &self.reverse
-    }
-
-    /// (Optional) Access counts for metrics/debug.
-    pub fn counts(&self) -> &HashMap<i32, u32> {
-        &self.counts
+        &self.mapped_to_token
     }
 }
 
@@ -65,21 +96,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skeleton_compiles_and_has_shapes() {
-        // Build from small payload.
-        let fm = FreqMap::from_token_ids(&[1, 1, 2, 3, 3, 3]);
-        // Later: assert ranks like 3->0, 1->1, 2->2, etc.
-        // Example checks we’ll enable once implemented:
-        // assert_eq!(fm.map_token(3), Some(0));
-        // assert_eq!(fm.map_token(1), Some(1));
-        // assert_eq!(fm.map_token(2), Some(2));
-        // assert_eq!(fm.unmap_token(0), Some(3));
-        // assert_eq!(fm.unmap_token(1), Some(1));
-        // assert_eq!(fm.unmap_token(2), Some(2));
+    fn freq_map_basic_ordering() {
+        // Example payload: 1 appears 3 times, 2 appears 2 times, 3 appears 1 time.
+        // So mapping should be: 1 -> 0, 2 -> 1, 3 -> 2.
+        let ids = [1, 2, 1, 3, 2, 1];
+        let fm = FreqMap::from_token_ids(&ids);
 
-        // For now, just ensure ordered_tokens returns a slice (possibly empty).
-        let _ot = fm.ordered_tokens();
-        // And counts exist.
-        let _c = fm.counts();
+        // Forward mapping checks.
+        assert_eq!(fm.map_token(1), Some(0));
+        assert_eq!(fm.map_token(2), Some(1));
+        assert_eq!(fm.map_token(3), Some(2));
+
+        // Reverse mapping checks.
+        assert_eq!(fm.unmap_token(0), Some(1));
+        assert_eq!(fm.unmap_token(1), Some(2));
+        assert_eq!(fm.unmap_token(2), Some(3));
+
+        // Out-of-range mapped IDs should return None.
+        assert_eq!(fm.unmap_token(3), None);
+
+        // ordered_tokens should be [1, 2, 3] for this example.
+        assert_eq!(fm.ordered_tokens(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn freq_map_tie_break_on_token_id() {
+        // Here 10 and 20 both appear once; 5 appears once too.
+        // All counts are equal, so ordering falls back to token ID ascending:
+        // tokens = [5, 10, 20], so mapped IDs: 5->0, 10->1, 20->2.
+        let ids = [10, 20, 5];
+        let fm = FreqMap::from_token_ids(&ids);
+
+        assert_eq!(fm.map_token(5), Some(0));
+        assert_eq!(fm.map_token(10), Some(1));
+        assert_eq!(fm.map_token(20), Some(2));
+        assert_eq!(fm.ordered_tokens(), &[5, 10, 20]);
     }
 }
